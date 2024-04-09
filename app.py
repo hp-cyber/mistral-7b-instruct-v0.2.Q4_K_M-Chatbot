@@ -9,8 +9,8 @@ import streamlit as st
 from PIL import Image
 from chromadb.utils import embedding_functions
 import chromadb
+import json
 
-# Symbolic Representation using spaCy for NLP
 class SymbolicRepresentation:
     def __init__(self):
         try:
@@ -23,42 +23,29 @@ class SymbolicRepresentation:
         if not self.nlp:
             return []
         doc = self.nlp(text)
-        symbols = []
-        for token in doc:
-            if token.pos_ in ['NOUN', 'VERB']:
-                symbols.append(f"{token.lemma_}:{token.pos_}")
+        symbols = [f"{token.lemma_}:{token.pos_}" for token in doc if token.pos_ in ['NOUN', 'VERB', 'ADJ', 'ADV', 'PRON', 'NUM', 'SYM', 'ADP', 'CONJ', 'DET', 'PART', 'PUNCT', 'X']]
         return symbols
 
-# Graph-based Memory Layer enhanced with Symbolic Representation
 class GraphMemoryLayer:
     def __init__(self):
         self.graph = nx.DiGraph()
         self.symbolic_rep = SymbolicRepresentation()
 
     def update_graph(self, user_input, ai_response):
-        current_time = time.time()
         user_symbols = self.symbolic_rep.text_to_symbol(user_input)
         ai_symbols = self.symbolic_rep.text_to_symbol(ai_response)
         
-        user_node = f"user: {user_input}"
-        ai_node = f"ai: {ai_response}"
-        self.graph.add_node(user_node, type='user', text=user_input, symbols=user_symbols, timestamp=current_time)
-        self.graph.add_node(ai_node, type='ai', text=ai_response, symbols=ai_symbols, timestamp=current_time)
+        user_node = f"user_{len(self.graph.nodes) + 1}"
+        ai_node = f"ai_{len(self.graph.nodes) + 2}"
+        self.graph.add_node(user_node, type='user', text=user_input, symbols=user_symbols)
+        self.graph.add_node(ai_node, type='ai', text=ai_response, symbols=ai_symbols)
         
         for symbol in set(user_symbols) & set(ai_symbols):
-            self.graph.add_edge(user_node, ai_node, symbol=symbol, timestamp=current_time)
+            self.graph.add_edge(user_node, ai_node, symbol=symbol)
 
-    def recall_context(self, current_input):
-        decayed_text = []
-        current_time = time.time()
-        decay_threshold = 300  # Example: 5 minutes as decay threshold
-
-        for node in self.graph:
-            node_time = self.graph.nodes[node]['timestamp']
-            if (current_time - node_time) < decay_threshold:
-                decayed_text.append(self.graph.nodes[node]['text'])
-        
-        return ' '.join(decayed_text)
+    def recall_context(self):
+        texts = [data['text'] for node, data in self.graph.nodes(data=True) if data['type'] == 'user']
+        return ' '.join(texts[-3:])
 
 class ChatAI:
     def __init__(self):
@@ -67,72 +54,58 @@ class ChatAI:
         self.collection = self.client.get_or_create_collection(name="collection_chat", embedding_function=self.embedding_model)
         self.memory_layer = GraphMemoryLayer()
 
-    def model(self, questions):
+    def model(self, question):
         try:
-            llm = LlamaCpp(model_path="./mistral-7b-instruct-v0.2.Q4_K_M.gguf",
-                           n_ctx=32768,
-                           n_threads=8,
-                           n_gpu_layers=-1)
-            conversation = ConversationChain(
-                llm=llm,
-                memory=ConversationBufferMemory()
-            )
+            llm = LlamaCpp(model_path="./mistral-7b-instruct-v0.2.Q4_K_M.gguf", n_ctx=32768, n_threads=8, n_gpu_layers=-1)
+            conversation = ConversationChain(llm=llm, memory=ConversationBufferMemory())
             
-            context = self.memory_layer.recall_context(questions) + ' ' + questions
+            context = self.memory_layer.recall_context() + ' ' + question
             response = conversation.predict(input=context).split("\n")[0]
-            self.memory_layer.update_graph(questions, response)
+            
+            self.memory_layer.update_graph(question, response)
+            
             return response
         except Exception as e:
             print(f"Error during model prediction: {e}")
             return "Sorry, I encountered an error processing your request."
 
     def create_table(self):
-        try:
-            conn = sqlite3.connect('./chat_ai.db')
-            cur = conn.cursor()
-            sql = """CREATE TABLE IF NOT EXISTS chat_history_data (
-                                        user varchar(8),
-                                        ai varchar(8),
-                                        user_word varchar(2000), 
-                                        ai_word varchar(2000),
-                                        updatetime varchar(64)
-                                    );"""
-            cur.execute(sql)
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"SQLite error: {e}")
-        finally:
-            cur.close()
-            conn.close()
+        with sqlite3.connect('./chat_ai.db') as conn:
+            try:
+                cur = conn.cursor()
+                sql = """CREATE TABLE IF NOT EXISTS chat_history_data (
+                                            conversation_id INTEGER PRIMARY KEY,
+                                            conversation TEXT, 
+                                            updatetime TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                        );"""
+                cur.execute(sql)
+            except sqlite3.Error as e:
+                print(f"SQLite error: {e}")
 
-    def insert_sqllite3(self, user_word, ai_word):
-        try:
-            conn = sqlite3.connect('./chat_ai.db')
-            cur = conn.cursor()
-            insert_sql = """insert into chat_history_data values(?,?,?,?,?) """
-            cur.execute(insert_sql, ('user', 'assistant', user_word, ai_word, time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())))
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"SQLite error: {e}")
-        finally:
-            cur.close()
-            conn.close()
+    def insert_sqllite3(self, conversation):
+        with sqlite3.connect('./chat_ai.db') as conn:
+            try:
+                cur = conn.cursor()
+                insert_sql = """INSERT INTO chat_history_data (conversation) VALUES (?)"""
+                cur.execute(insert_sql, (json.dumps(conversation),))
+            except sqlite3.Error as e:
+                print(f"SQLite error: {e}")
 
     def get_data_from_sqllite3(self):
         try:
-            conn = sqlite3.connect('./chat_ai.db')
-            cur = conn.cursor()
-            res = cur.execute("select * from chat_history_data")
-            result_data = res.fetchall()
+            with sqlite3.connect('./chat_ai.db') as conn:
+                cur = conn.cursor()
+                res = cur.execute("SELECT * FROM chat_history_data")
+                result_data = [{"conversation_id": row[0], "conversation": json.loads(row[1]), "updatetime": row[2]} for row in res.fetchall()]
             return result_data
         except sqlite3.Error as e:
             print(f"SQLite error: {e}")
             return []
-        finally:
-            cur.close()
-            conn.close()
 
     def insert_chromadb(self):
+        """
+        Inserts chat history data into ChromaDB.
+        """
         try:
             self.collection.delete(ids=["id1", "id2"])
             res = self.get_data_from_sqllite3()
@@ -144,25 +117,43 @@ class ChatAI:
             print(f"ChromaDB error: {e}")
 
     def chatbot_ui(self):
+        """
+        Implements the user interface for the chatbot.
+        """
         st.title("Chat Bot")
-        if "messages" not in st.session_state:
-            st.session_state["messages"] = [{"role": "assistant", "content": "Hi, how can I help you?"}]
-        for msg in st.session_state.messages:
+        # Use a session variable to keep track of a list of messages as a conversation
+        if "conversation" not in st.session_state:
+            st.session_state["conversation"] = []
+        
+        for msg in st.session_state["conversation"]:
             st.chat_message(msg["role"]).markdown(msg["content"])
+
         if questions := st.chat_input():
             response = self.model(questions)
-            st.session_state.messages.append({"role": "user", "content": questions})
-            st.session_state.messages.append({"role": "assistant", "content": response})
-            self.insert_sqllite3(user_word=questions, ai_word=response)
-            # Trigger a rerun to update the UI with the new messages
-            st.experimental_rerun()
+            st.session_state["conversation"].append({"role": "user", "content": questions})
+            st.session_state["conversation"].append({"role": "assistant", "content": response})
+            # Do not insert here, we will insert the whole conversation when it ends
+            st.rerun()
 
-        if st.button("Clear Chat"):
-            st.session_state.messages = [{"role": "assistant", "content": "Hi, how can I help you?"}]
-            # Rerun after clearing chat to refresh the UI
-            st.experimental_rerun()
+        if st.button("End Conversation"):
+            # Insert the whole conversation into the database
+            self.insert_sqllite3(st.session_state["conversation"])
+            st.session_state["conversation"] = []
+            st.rerun()
+
+        # Additional button to start a new conversation, not necessary if using End Conversation
+        if st.button("Start New Conversation"):
+            if st.session_state["conversation"]:
+                # Insert the current conversation before starting a new one
+                self.insert_sqllite3(st.session_state["conversation"])
+            st.session_state["conversation"] = []
+            st.rerun()
+
 
     def menu(self):
+        """
+        Displays the menu options and handles user's choice.
+        """
         self.create_table()
         menu = ['Home', 'Chat Bot', 'Chat History']
         choice = st.sidebar.radio('Menu', menu)
@@ -181,10 +172,18 @@ class ChatAI:
             self.view_chat_history()
 
     def view_chat_history(self):
+        """
+        Displays the chat history stored in SQLite database.
+        """
         st.title("Chat History")
         res = self.get_data_from_sqllite3()
-        for idx, (user, ai, user_word, ai_word, updatetime) in enumerate(res):
-            st.text_area(label=f"Conversation {idx+1}", value=f"User: {user_word}\nAI: {ai_word}", height=100)
+        for idx, item in enumerate(res):
+            conversation_id = item['conversation_id']
+            conversation = item['conversation']
+            updatetime = item['updatetime']
+            # Assuming the conversation is a list of messages
+            conversation_text = "\n".join(f"{msg['role']}: {msg['content']}" for msg in conversation)
+            st.text_area(label=f"Conversation {conversation_id} from {updatetime}", value=conversation_text, height=200)
 
 chat = ChatAI()
 chat.menu()
