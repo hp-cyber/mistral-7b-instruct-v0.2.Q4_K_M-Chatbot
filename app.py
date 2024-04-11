@@ -94,13 +94,18 @@ class ChatAI:
         self.collection = self.client.get_or_create_collection(name="collection_chat", embedding_function=self.embedding_model)
         self.memory_layer = GraphMemoryLayer()
 
-    def model(self, question):
+    def model(self, question, multi_response=False):
         try:
             llm = LlamaCpp(model_path="./mistral-7b-instruct-v0.2.Q4_K_M.gguf", n_ctx=32768, n_threads=8, n_gpu_layers=-1)
             conversation = ConversationChain(llm=llm, memory=ConversationBufferMemory())
             
             context = self.memory_layer.recall_context() + ' ' + question
-            response = conversation.predict(input=context).split("\n")[0]
+            if multi_response:
+                responses = [conversation.predict(input=f"{context} Option {i}").split("\n")[0] for i in range(1, 4)]
+                selected_response = self.evaluate_responses(question, responses)
+                response = selected_response
+            else:
+                response = conversation.predict(input=context).split("\n")[0]
             
             self.memory_layer.update_graph(question, response)
             
@@ -109,6 +114,39 @@ class ChatAI:
             print(f"Error during model prediction: {e}")
             return "Sorry, I encountered an error processing your request."
 
+    def evaluate_responses(self, question, responses):
+        # Step 1: Convert the question and responses to symbolic representation
+        question_symbols = set(self.symbolic_rep.text_to_symbol(question))
+        response_symbols = [set(self.symbolic_rep.text_to_symbol(response)) for response in responses]
+
+        # Step 2: Fetch context from the graph memory
+        recent_context_symbols = set()
+        for text, _ in self.memory_layer.query_context([question]):
+            recent_context_symbols.update(self.symbolic_rep.text_to_symbol(text))
+        
+        # Step 3: Score responses based on their relevance to the question and context
+        scores = []
+        for response_set in response_symbols:
+            relevance_to_question = len(response_set & question_symbols)
+            relevance_to_context = len(response_set & recent_context_symbols)
+            score = relevance_to_question + relevance_to_context
+            scores.append(score)
+        
+        # Step 4: Select the response with the highest score
+        best_response_index = scores.index(max(scores))
+        return responses[best_response_index]
+
+    def iterative_response_planning(self, question):
+        # This method simulates generating a plan with multiple steps, revising each based on simulated feedback
+        initial_responses = self.model(question, multi_response=True)
+        # Evaluate the initial responses to select the most promising direction
+        selected_response = self.evaluate_responses(question, initial_responses)
+        # Simulate receiving new information or feedback that might affect the plan
+        new_info = "Simulated new information"
+        # Revise the plan based on the new information
+        revised_response = self.model(new_info, multi_response=False)
+        return revised_response
+    
     def create_table(self):
         with sqlite3.connect('./chat_ai.db') as conn:
             try:
@@ -214,4 +252,5 @@ class ChatAI:
 
 chat = ChatAI()
 chat.menu()
+
 
