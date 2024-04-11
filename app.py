@@ -87,6 +87,20 @@ class GraphMemoryLayer:
         return ' '.join(texts[-3:])
 
 class ChatAI:
+    """
+    A class representing a Chat AI.
+
+    This class provides methods for interacting with a chatbot model, managing conversation history,
+    and storing/retrieving chat history data.
+
+    Attributes:
+        symbolic_rep (SymbolicRepresentation): An instance of the SymbolicRepresentation class.
+        embedding_model (DefaultEmbeddingFunction): An instance of the DefaultEmbeddingFunction class.
+        client (PersistentClient): An instance of the PersistentClient class.
+        collection (Collection): An instance of the Collection class.
+        memory_layer (GraphMemoryLayer): An instance of the GraphMemoryLayer class.
+    """
+
     def __init__(self):
         self.symbolic_rep = SymbolicRepresentation()
         self.embedding_model = embedding_functions.DefaultEmbeddingFunction()
@@ -95,6 +109,16 @@ class ChatAI:
         self.memory_layer = GraphMemoryLayer()
 
     def model(self, question, multi_response=False):
+        """
+        Generate a response to a given question.
+
+        Args:
+            question (str): The input question.
+            multi_response (bool, optional): Whether to generate multiple responses. Defaults to False.
+
+        Returns:
+            str: The generated response.
+        """
         try:
             llm = LlamaCpp(model_path="./mistral-7b-instruct-v0.2.Q4_K_M.gguf", n_ctx=32768, n_threads=8, n_gpu_layers=-1)
             conversation = ConversationChain(llm=llm, memory=ConversationBufferMemory())
@@ -115,6 +139,16 @@ class ChatAI:
             return "Sorry, I encountered an error processing your request."
 
     def evaluate_responses(self, question, responses):
+        """
+        Evaluate the responses based on their relevance to the question and context.
+
+        Args:
+            question (str): The input question.
+            responses (list): A list of response strings.
+
+        Returns:
+            str: The selected response with the highest score.
+        """
         # Step 1: Convert the question and responses to symbolic representation
         question_symbols = set(self.symbolic_rep.text_to_symbol(question))
         response_symbols = [set(self.symbolic_rep.text_to_symbol(response)) for response in responses]
@@ -137,17 +171,25 @@ class ChatAI:
         return responses[best_response_index]
 
     def iterative_response_planning(self, question):
-        # This method simulates generating a plan with multiple steps, revising each based on simulated feedback
+        """
+        Simulate generating a plan with multiple steps, revising each based on simulated feedback.
+
+        Args:
+            question (str): The input question.
+
+        Returns:
+            str: The revised response after iterative planning.
+        """
         initial_responses = self.model(question, multi_response=True)
-        # Evaluate the initial responses to select the most promising direction
         selected_response = self.evaluate_responses(question, initial_responses)
-        # Simulate receiving new information or feedback that might affect the plan
         new_info = "Simulated new information"
-        # Revise the plan based on the new information
         revised_response = self.model(new_info, multi_response=False)
         return revised_response
     
     def create_table(self):
+        """
+        Create a table in the SQLite database for storing chat history data.
+        """
         with sqlite3.connect('./chat_ai.db') as conn:
             try:
                 cur = conn.cursor()
@@ -161,6 +203,13 @@ class ChatAI:
                 print(f"SQLite error: {e}")
 
     def insert_sqllite3(self, conversation):
+        """
+        Insert a conversation into the SQLite database.
+
+        Args:
+            conversation (list): A list representing the conversation.
+
+        """
         with sqlite3.connect('./chat_ai.db') as conn:
             try:
                 cur = conn.cursor()
@@ -170,6 +219,12 @@ class ChatAI:
                 print(f"SQLite error: {e}")
 
     def get_data_from_sqllite3(self):
+        """
+        Retrieve chat history data from the SQLite database.
+
+        Returns:
+            list: A list of dictionaries representing the chat history data.
+        """
         try:
             with sqlite3.connect('./chat_ai.db') as conn:
                 cur = conn.cursor()
@@ -181,6 +236,11 @@ class ChatAI:
             return []
 
     def insert_chromadb(self):
+        """
+        Insert chat history data into ChromaDB.
+
+        This method deletes existing data in ChromaDB and inserts new data from the SQLite database.
+        """
         try:
             self.collection.delete(ids=["id1", "id2"])
             res = self.get_data_from_sqllite3()
@@ -192,6 +252,11 @@ class ChatAI:
             print(f"ChromaDB error: {e}")
 
     def chatbot_ui(self):
+        """
+        Run the chatbot user interface.
+
+        This method allows users to interact with the chatbot through a UI.
+        """
         st.title("Chat Bot")
         if "conversation" not in st.session_state:
             st.session_state["conversation"] = []
@@ -224,6 +289,11 @@ class ChatAI:
             st.rerun()
 
     def menu(self):
+        """
+        Display the main menu and handle user choices.
+
+        This method allows users to navigate through different sections of the chatbot application.
+        """
         self.create_table()
         menu = ['Home', 'Chat Bot', 'Chat History']
         choice = st.sidebar.radio('Menu', menu)
@@ -241,6 +311,11 @@ class ChatAI:
             self.view_chat_history()
 
     def view_chat_history(self):
+        """
+        Display the chat history.
+
+        This method retrieves chat history data from the SQLite database and displays it in the UI.
+        """
         st.title("Chat History")
         res = self.get_data_from_sqllite3()
         for idx, item in enumerate(res):
@@ -252,5 +327,6 @@ class ChatAI:
 
 chat = ChatAI()
 chat.menu()
+
 
 
