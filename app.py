@@ -23,25 +23,64 @@ class SymbolicRepresentation:
         if not self.nlp:
             return []
         doc = self.nlp(text)
-        symbols = [f"{token.lemma_}:{token.pos_}" for token in doc if token.pos_ in ['NOUN', 'VERB', 'ADJ', 'ADV', 'PRON', 'NUM', 'SYM', 'ADP', 'CONJ', 'DET', 'PART', 'PUNCT', 'X']]
+        symbols = []
+        for token in doc:
+            basic_symbol = f"{token.lemma_}:{token.pos_}"
+            symbols.append(basic_symbol)
+
+            if token.dep_ != "punct":
+                relation = f"{token.dep_}({token.head.lemma_}, {token.lemma_})"
+                symbols.append(relation)
+
+            if token.head.pos_ == "VERB":
+                action = f"action({token.head.lemma_}, {token.lemma_})"
+                symbols.append(action)
+
+            for child in token.children:
+                if child.dep_ != "punct":
+                    relation = f"{child.dep_}({token.lemma_}, {child.lemma_})"
+                    symbols.append(relation)
+
         return symbols
+
+    def extract_intent(self, text):
+        doc = self.nlp(text)
+        for token in doc:
+            if token.dep_ == "ROOT" and token.pos_ == "VERB":
+                return f"intent({token.lemma_})"
+        return "intent(unknown)"
 
 class GraphMemoryLayer:
     def __init__(self):
         self.graph = nx.DiGraph()
-        self.symbolic_rep = SymbolicRepresentation()
 
-    def update_graph(self, user_input, ai_response):
-        user_symbols = self.symbolic_rep.text_to_symbol(user_input)
-        ai_symbols = self.symbolic_rep.text_to_symbol(ai_response)
-        
+    def update_graph(self, user_input, ai_response, user_feedback=None):
+        current_time = time.time()
         user_node = f"user_{len(self.graph.nodes) + 1}"
         ai_node = f"ai_{len(self.graph.nodes) + 2}"
-        self.graph.add_node(user_node, type='user', text=user_input, symbols=user_symbols)
-        self.graph.add_node(ai_node, type='ai', text=ai_response, symbols=ai_symbols)
-        
-        for symbol in set(user_symbols) & set(ai_symbols):
-            self.graph.add_edge(user_node, ai_node, symbol=symbol)
+
+        initial_weight = 1 + (0.2 if user_feedback == "positive" else -0.1 if user_feedback == "negative" else 0)
+        self.graph.add_node(user_node, type='user', text=user_input, timestamp=current_time, weight=initial_weight)
+        self.graph.add_node(ai_node, type='ai', text=ai_response, timestamp=current_time, weight=initial_weight)
+
+        for symbol in set(user_input) & set(ai_response):
+            self.graph.add_edge(user_node, ai_node, symbol=symbol, timestamp=current_time, weight=initial_weight)
+
+    def decay_memory(self, base_decay=0.95, relevance_factor=1.05):
+        current_time = time.time()
+        for _, data in self.graph.nodes(data=True):
+            time_diff = current_time - data['timestamp']
+            decay_factor = base_decay ** time_diff
+            adjusted_weight = data['weight'] * decay_factor * relevance_factor
+            data['weight'] = adjusted_weight if adjusted_weight > 0.1 else 0.1
+
+    def query_context(self, query_terms):
+        relevant_texts = []
+        for node, data in self.graph.nodes(data=True):
+            if any(term in data['text'] for term in query_terms):
+                relevant_texts.append((data['text'], data['weight']))
+        relevant_texts.sort(key=lambda x: x[1], reverse=True)
+        return relevant_texts[:3]
 
     def recall_context(self):
         texts = [data['text'] for node, data in self.graph.nodes(data=True) if data['type'] == 'user']
@@ -49,6 +88,7 @@ class GraphMemoryLayer:
 
 class ChatAI:
     def __init__(self):
+        self.symbolic_rep = SymbolicRepresentation()
         self.embedding_model = embedding_functions.DefaultEmbeddingFunction()
         self.client = chromadb.PersistentClient(path="./chroma_client")
         self.collection = self.client.get_or_create_collection(name="collection_chat", embedding_function=self.embedding_model)
@@ -103,64 +143,55 @@ class ChatAI:
             return []
 
     def insert_chromadb(self):
-        """
-        Inserts chat history data into ChromaDB.
-        """
         try:
             self.collection.delete(ids=["id1", "id2"])
             res = self.get_data_from_sqllite3()
             for c in res:
-                em = self.embedding_model([c[2], c[3]])
-                self.collection.add(ids=['id1', 'id2'], documents=[c[2], c[3]], embeddings=em, metadatas=[{"role": "user"}, {"role": "assistant"}])
-                print(f"{c[2]} and {c[3]} inserted into chromadb successfully")
+                em = self.embedding_model([c['conversation'], c['conversation']])
+                self.collection.add(ids=[f"id_{c['conversation_id']}"], documents=[c['conversation']], embeddings=em, metadatas=[{"role": "conversation"}])
+                print(f"Conversation {c['conversation_id']} inserted into chromadb successfully")
         except Exception as e:
             print(f"ChromaDB error: {e}")
 
     def chatbot_ui(self):
-        """
-        Implements the user interface for the chatbot.
-        """
         st.title("Chat Bot")
-        # Use a session variable to keep track of a list of messages as a conversation
         if "conversation" not in st.session_state:
             st.session_state["conversation"] = []
-        
+
+        feedback = None
         for msg in st.session_state["conversation"]:
-            st.chat_message(msg["role"]).markdown(msg["content"])
+            if msg["role"] == "user":
+                st.chat_message("user").markdown(msg["content"])
+            else:
+                feedback = st.radio("How relevant was this response?", ("Positive", "Negative", "Neutral"), key=msg["content"])
+                st.chat_message("assistant").markdown(msg["content"])
+                if feedback:
+                    self.memory_layer.update_graph(msg["content"], feedback, user_feedback=feedback.lower())
 
         if questions := st.chat_input():
             response = self.model(questions)
             st.session_state["conversation"].append({"role": "user", "content": questions})
             st.session_state["conversation"].append({"role": "assistant", "content": response})
-            # Do not insert here, we will insert the whole conversation when it ends
             st.rerun()
 
         if st.button("End Conversation"):
-            # Insert the whole conversation into the database
             self.insert_sqllite3(st.session_state["conversation"])
             st.session_state["conversation"] = []
             st.rerun()
 
-        # Additional button to start a new conversation, not necessary if using End Conversation
         if st.button("Start New Conversation"):
             if st.session_state["conversation"]:
-                # Insert the current conversation before starting a new one
                 self.insert_sqllite3(st.session_state["conversation"])
             st.session_state["conversation"] = []
             st.rerun()
 
-
     def menu(self):
-        """
-        Displays the menu options and handles user's choice.
-        """
         self.create_table()
         menu = ['Home', 'Chat Bot', 'Chat History']
         choice = st.sidebar.radio('Menu', menu)
         if choice == 'Home':
             st.title("Welcome to Chat Bot!")
-            st.text("I am a chat bot! I can help you answer some questions that you want to know. Let’s begin!")
-            image_path = "./chat_bot.png"  # Ensure this path is correct
+            image_path = "./chat_bot.png"
             try:
                 image = Image.open(image_path)
                 st.image(image=image, use_column_width=True)
@@ -172,18 +203,15 @@ class ChatAI:
             self.view_chat_history()
 
     def view_chat_history(self):
-        """
-        Displays the chat history stored in SQLite database.
-        """
         st.title("Chat History")
         res = self.get_data_from_sqllite3()
         for idx, item in enumerate(res):
             conversation_id = item['conversation_id']
             conversation = item['conversation']
             updatetime = item['updatetime']
-            # Assuming the conversation is a list of messages
             conversation_text = "\n".join(f"{msg['role']}: {msg['content']}" for msg in conversation)
             st.text_area(label=f"Conversation {conversation_id} from {updatetime}", value=conversation_text, height=200)
 
 chat = ChatAI()
 chat.menu()
+
