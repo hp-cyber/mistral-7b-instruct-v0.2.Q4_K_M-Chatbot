@@ -1,16 +1,21 @@
 import sqlite3
 import spacy
 import time
+from neo4j import GraphDatabase
 from langchain.chains import ConversationChain
 from langchain.chains.conversation.memory import ConversationBufferMemory
 from langchain_community.llms import LlamaCpp
-import networkx as nx
 import streamlit as st
 from PIL import Image
 from chromadb.utils import embedding_functions
 import chromadb
 import json
 
+# Decay and growth rates for memory evolution
+DECAY_RATE = 0.05
+GROWTH_RATE = 0.1
+
+# Load spaCy model and enhance symbolic representation
 class SymbolicRepresentation:
     def __init__(self):
         try:
@@ -27,20 +32,20 @@ class SymbolicRepresentation:
         for token in doc:
             basic_symbol = f"{token.lemma_}:{token.pos_}"
             symbols.append(basic_symbol)
-
             if token.dep_ != "punct":
                 relation = f"{token.dep_}({token.head.lemma_}, {token.lemma_})"
                 symbols.append(relation)
-
             if token.head.pos_ == "VERB":
                 action = f"action({token.head.lemma_}, {token.lemma_})"
                 symbols.append(action)
-
             for child in token.children:
                 if child.dep_ != "punct":
                     relation = f"{child.dep_}({token.lemma_}, {child.lemma_})"
                     symbols.append(relation)
-
+        noun_chunks = [chunk.text for chunk in doc.noun_chunks]
+        entities = [(ent.text, ent.label_) for ent in doc.ents]
+        symbols.extend(noun_chunks)
+        symbols.extend([f"entity({ent[0]}:{ent[1]})" for ent in entities])
         return symbols
 
     def extract_intent(self, text):
@@ -50,75 +55,76 @@ class SymbolicRepresentation:
                 return f"intent({token.lemma_})"
         return "intent(unknown)"
 
+# Neo4j graph database integration for memory management
 class GraphMemoryLayer:
-    def __init__(self):
-        self.graph = nx.DiGraph()
+    def __init__(self, uri, user, password):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    def close(self):
+        self.driver.close()
 
     def update_graph(self, user_input, ai_response, user_feedback=None):
         current_time = time.time()
-        user_node = f"user_{len(self.graph.nodes) + 1}"
-        ai_node = f"ai_{len(self.graph.nodes) + 2}"
+        feedback_weight = 0.2 if user_feedback == "positive" else -0.1 if user_feedback == "negative" else 0
+        with self.driver.session() as session:
+            session.write_transaction(self._create_and_link, user_input, ai_response, current_time, feedback_weight)
 
-        initial_weight = 1 + (0.2 if user_feedback == "positive" else -0.1 if user_feedback == "negative" else 0)
-        self.graph.add_node(user_node, type='user', text=user_input, timestamp=current_time, weight=initial_weight)
-        self.graph.add_node(ai_node, type='ai', text=ai_response, timestamp=current_time, weight=initial_weight)
-
-        for symbol in set(user_input) & set(ai_response):
-            self.graph.add_edge(user_node, ai_node, symbol=symbol, timestamp=current_time, weight=initial_weight)
-
-    def decay_memory(self, base_decay=0.95, relevance_factor=1.05):
-        current_time = time.time()
-        for _, data in self.graph.nodes(data=True):
-            time_diff = current_time - data['timestamp']
-            decay_factor = base_decay ** time_diff
-            adjusted_weight = data['weight'] * decay_factor * relevance_factor
-            data['weight'] = adjusted_weight if adjusted_weight > 0.1 else 0.1
+    @staticmethod
+    def _create_and_link(tx, user_input, ai_response, timestamp, feedback_weight):
+        query = """
+        MERGE (u:UserInput {text: $user_input})
+        ON CREATE SET u.activation_rate = 1.0, u.created_at = $timestamp
+        ON MATCH SET u.activation_rate = u.activation_rate * exp(-$decay_rate * ($timestamp - u.last_updated)) + $growth_rate,
+                    u.last_updated = $timestamp
+        MERGE (a:AIResponse {text: $ai_response})
+        ON CREATE SET a.activation_rate = 1.0, a.created_at = $timestamp
+        ON MATCH SET a.activation_rate = a.activation_rate * exp(-$decay_rate * ($timestamp - a.last_updated)) + $growth_rate,
+                    a.last_updated = $timestamp
+        MERGE (u)-[r:RESPONDS_TO]->(a)
+        ON CREATE SET r.strength = 1.0, r.created_at = $timestamp
+        ON MATCH SET r.strength = r.strength * exp(-$decay_rate * ($timestamp - r.last_updated)) + $feedback_weight,
+                    r.last_updated = $timestamp
+        """
+        tx.run(query, user_input=user_input, ai_response=ai_response, timestamp=timestamp, decay_rate=DECAY_RATE, growth_rate=GROWTH_RATE, feedback_weight=feedback_weight)
 
     def query_context(self, query_terms):
-        relevant_texts = []
-        for node, data in self.graph.nodes(data=True):
-            if any(term in data['text'] for term in query_terms):
-                relevant_texts.append((data['text'], data['weight']))
-        relevant_texts.sort(key=lambda x: x[1], reverse=True)
-        return relevant_texts[:3]
+        with self.driver.session() as session:
+            return session.read_transaction(self._find_relevant_texts, query_terms)
+
+    @staticmethod
+    def _find_relevant_texts(tx, query_terms):
+        query = """
+        MATCH (n)
+        WHERE any(term in $query_terms WHERE term IN n.text)
+        RETURN n.text as text, n.timestamp as timestamp
+        ORDER BY n.timestamp DESC LIMIT 3
+        """
+        result = tx.run(query, query_terms=query_terms)
+        return [(record["text"], record["timestamp"]) for record in result]
 
     def recall_context(self):
-        texts = [data['text'] for node, data in self.graph.nodes(data=True) if data['type'] == 'user']
-        return ' '.join(texts[-3:])
+        with self.driver.session() as session:
+            return session.read_transaction(self._recall_recent_texts)
+
+    @staticmethod
+    def _recall_recent_texts(tx):
+        query = """
+        MATCH (n:UserInput)
+        RETURN n.text as text
+        ORDER BY n.timestamp DESC LIMIT 3
+        """
+        result = tx.run(query)
+        return ' '.join([record["text"] for record in result])
 
 class ChatAI:
-    """
-    A class representing a Chat AI.
-
-    This class provides methods for interacting with a chatbot model, managing conversation history,
-    and storing/retrieving chat history data.
-
-    Attributes:
-        symbolic_rep (SymbolicRepresentation): An instance of the SymbolicRepresentation class.
-        embedding_model (DefaultEmbeddingFunction): An instance of the DefaultEmbeddingFunction class.
-        client (PersistentClient): An instance of the PersistentClient class.
-        collection (Collection): An instance of the Collection class.
-        memory_layer (GraphMemoryLayer): An instance of the GraphMemoryLayer class.
-    """
-
-    def __init__(self):
+    def __init__(self, uri, user, password):
         self.symbolic_rep = SymbolicRepresentation()
         self.embedding_model = embedding_functions.DefaultEmbeddingFunction()
         self.client = chromadb.PersistentClient(path="./chroma_client")
         self.collection = self.client.get_or_create_collection(name="collection_chat", embedding_function=self.embedding_model)
-        self.memory_layer = GraphMemoryLayer()
+        self.memory_layer = GraphMemoryLayer(uri, user, password)
 
     def model(self, question, multi_response=False):
-        """
-        Generate a response to a given question.
-
-        Args:
-            question (str): The input question.
-            multi_response (bool, optional): Whether to generate multiple responses. Defaults to False.
-
-        Returns:
-            str: The generated response.
-        """
         try:
             llm = LlamaCpp(model_path="./mistral-7b-instruct-v0.2.Q4_K_M.gguf", n_ctx=32768, n_threads=8, n_gpu_layers=-1)
             conversation = ConversationChain(llm=llm, memory=ConversationBufferMemory())
@@ -139,26 +145,12 @@ class ChatAI:
             return "Sorry, I encountered an error processing your request."
 
     def evaluate_responses(self, question, responses):
-        """
-        Evaluate the responses based on their relevance to the question and context.
-
-        Args:
-            question (str): The input question.
-            responses (list): A list of response strings.
-
-        Returns:
-            str: The selected response with the highest score.
-        """
-        # Step 1: Convert the question and responses to symbolic representation
         question_symbols = set(self.symbolic_rep.text_to_symbol(question))
         response_symbols = [set(self.symbolic_rep.text_to_symbol(response)) for response in responses]
-
-        # Step 2: Fetch context from the graph memory
         recent_context_symbols = set()
         for text, _ in self.memory_layer.query_context([question]):
             recent_context_symbols.update(self.symbolic_rep.text_to_symbol(text))
         
-        # Step 3: Score responses based on their relevance to the question and context
         scores = []
         for response_set in response_symbols:
             relevance_to_question = len(response_set & question_symbols)
@@ -166,30 +158,10 @@ class ChatAI:
             score = relevance_to_question + relevance_to_context
             scores.append(score)
         
-        # Step 4: Select the response with the highest score
         best_response_index = scores.index(max(scores))
         return responses[best_response_index]
 
-    def iterative_response_planning(self, question):
-        """
-        Simulate generating a plan with multiple steps, revising each based on simulated feedback.
-
-        Args:
-            question (str): The input question.
-
-        Returns:
-            str: The revised response after iterative planning.
-        """
-        initial_responses = self.model(question, multi_response=True)
-        selected_response = self.evaluate_responses(question, initial_responses)
-        new_info = "Simulated new information"
-        revised_response = self.model(new_info, multi_response=False)
-        return revised_response
-    
     def create_table(self):
-        """
-        Create a table in the SQLite database for storing chat history data.
-        """
         with sqlite3.connect('./chat_ai.db') as conn:
             try:
                 cur = conn.cursor()
@@ -203,13 +175,6 @@ class ChatAI:
                 print(f"SQLite error: {e}")
 
     def insert_sqllite3(self, conversation):
-        """
-        Insert a conversation into the SQLite database.
-
-        Args:
-            conversation (list): A list representing the conversation.
-
-        """
         with sqlite3.connect('./chat_ai.db') as conn:
             try:
                 cur = conn.cursor()
@@ -219,12 +184,6 @@ class ChatAI:
                 print(f"SQLite error: {e}")
 
     def get_data_from_sqllite3(self):
-        """
-        Retrieve chat history data from the SQLite database.
-
-        Returns:
-            list: A list of dictionaries representing the chat history data.
-        """
         try:
             with sqlite3.connect('./chat_ai.db') as conn:
                 cur = conn.cursor()
@@ -235,28 +194,7 @@ class ChatAI:
             print(f"SQLite error: {e}")
             return []
 
-    def insert_chromadb(self):
-        """
-        Insert chat history data into ChromaDB.
-
-        This method deletes existing data in ChromaDB and inserts new data from the SQLite database.
-        """
-        try:
-            self.collection.delete(ids=["id1", "id2"])
-            res = self.get_data_from_sqllite3()
-            for c in res:
-                em = self.embedding_model([c['conversation'], c['conversation']])
-                self.collection.add(ids=[f"id_{c['conversation_id']}"], documents=[c['conversation']], embeddings=em, metadatas=[{"role": "conversation"}])
-                print(f"Conversation {c['conversation_id']} inserted into chromadb successfully")
-        except Exception as e:
-            print(f"ChromaDB error: {e}")
-
     def chatbot_ui(self):
-        """
-        Run the chatbot user interface.
-
-        This method allows users to interact with the chatbot through a UI.
-        """
         st.title("Chat Bot")
         if "conversation" not in st.session_state:
             st.session_state["conversation"] = []
@@ -289,11 +227,6 @@ class ChatAI:
             st.rerun()
 
     def menu(self):
-        """
-        Display the main menu and handle user choices.
-
-        This method allows users to navigate through different sections of the chatbot application.
-        """
         self.create_table()
         menu = ['Home', 'Chat Bot', 'Chat History']
         choice = st.sidebar.radio('Menu', menu)
@@ -311,11 +244,6 @@ class ChatAI:
             self.view_chat_history()
 
     def view_chat_history(self):
-        """
-        Display the chat history.
-
-        This method retrieves chat history data from the SQLite database and displays it in the UI.
-        """
         st.title("Chat History")
         res = self.get_data_from_sqllite3()
         for idx, item in enumerate(res):
@@ -325,7 +253,10 @@ class ChatAI:
             conversation_text = "\n".join(f"{msg['role']}: {msg['content']}" for msg in conversation)
             st.text_area(label=f"Conversation {conversation_id} from {updatetime}", value=conversation_text, height=200)
 
-chat = ChatAI()
+uri = "bolt://localhost:7687"
+user = "neo4j"
+password = "52900000"  # Change to your actual password
+chat = ChatAI(uri, user, password)
 chat.menu()
 
 
